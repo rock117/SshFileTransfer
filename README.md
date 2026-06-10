@@ -62,8 +62,8 @@ sftp-download -H server.com -p 2222 -u user -P password --remote /file --local .
 # 断点续传（仅文件）
 sftp-download -H server.com -u user -P password --remote /large/file.iso --local ./file.iso --resume
 
-# 覆盖已存在的文件
-sftp-download -H server.com -u user -P password --remote /data --local ./data --force
+# 跳过已存在的文件（默认：覆盖）
+sftp-download -H server.com -u user -P password --remote /data --local ./data --skip
 
 # 指定并发下载数（仅目录）
 sftp-download -H server.com -u user -P password --remote /project --local ./project --parallel 8
@@ -82,7 +82,7 @@ sftp-download -H server.com -u user -P password --remote /project --local ./proj
 | `--timeout` | - | 连接超时(秒) | 30 |
 | `--remote` | `-r` | 远程文件/目录路径 | (必需) |
 | `--local` | `-l` | 本地保存路径 | (必需) |
-| `--force` | `-f` | 覆盖已存在文件 | false |
+| `--skip` | `-f` | 跳过已存在文件 | false（默认覆盖） |
 | `--resume` | - | 断点续传（仅文件） | false |
 | `--parallel` | `-j` | 并发下载数（仅目录） | 4 |
 

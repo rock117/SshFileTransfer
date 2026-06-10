@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 /// Download options
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
-    pub force: bool,
+    pub skip_existing: bool,
     pub resume: bool,
     pub parallel: usize,
 }
@@ -20,7 +20,7 @@ pub struct DownloadOptions {
 impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
-            force: false,
+            skip_existing: false,
             resume: false,
             parallel: 4,
         }
@@ -96,8 +96,12 @@ impl SftpDownloader {
         let file_size = file_info.size.unwrap_or(0);
 
         // Check local file
-        if local_path.exists() && !options.force && !options.resume {
-            return Err(AppError::PathExists(local_path.to_path_buf()));
+        if local_path.exists() && options.skip_existing && !options.resume {
+            let existing_size = local_path.metadata()?.len();
+            if existing_size >= file_size {
+                print_file_result(1, 1, file_name, file_size, existing_size, None);
+                return Ok(existing_size);
+            }
         }
 
         let start = Instant::now();
@@ -224,10 +228,10 @@ impl SftpDownloader {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let sftp = self.sftp.clone();
             let total_files = stats.total_files;
-            let force = options.force;
+            let skip_existing = options.skip_existing;
 
             let handle = tokio::spawn(async move {
-                let result = download_file_simple(&sftp, task, idx, total_files, force).await;
+                let result = download_file_simple(&sftp, task, idx, total_files, skip_existing).await;
                 drop(permit);
                 result
             });
@@ -368,15 +372,15 @@ async fn download_file_simple(
     task: DownloadTask,
     idx: usize,
     total_files: usize,
-    force: bool,
+    skip_existing: bool,
 ) -> Result<u64> {
     let file_name = Path::new(&task.remote_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&task.remote_path);
 
-    // Check if file exists
-    if task.local_path.exists() && !force {
+    // Check if file exists and should skip
+    if skip_existing && task.local_path.exists() {
         let existing_size = task.local_path.metadata()?.len();
         if existing_size >= task.file_size {
             print_file_result(idx + 1, total_files, file_name, task.file_size, task.file_size, None);

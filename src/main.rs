@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Auto-detect remote path type and download
     let stats = downloader.download_auto(&args.remote, &args.local, &DownloadOptions {
-        force: args.force,
+        skip_existing: args.skip,
         resume: args.resume,
         parallel: args.parallel,
     }).await?;

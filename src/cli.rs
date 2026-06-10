@@ -42,12 +42,12 @@ pub struct Args {
     #[arg(short, long)]
     pub local: PathBuf,
 
-    /// Overwrite existing files
+    /// Skip existing files (default: overwrite)
     #[arg(short, long)]
-    pub force: bool,
+    pub skip: bool,
 
     /// Resume partial download (file only)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "skip")]
     pub resume: bool,
 
     /// Maximum parallel downloads for directory
