@@ -5,6 +5,7 @@ use russh_sftp::client::SftpSession;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -61,10 +62,8 @@ impl SftpDownloader {
             .map_err(|e| AppError::FileNotFound(format!("{}: {}", remote_path, e)))?;
 
         if metadata.is_dir() {
-            println!("Detected directory: {}", remote_path);
             self.download_directory(remote_path, local_path, options).await
         } else {
-            println!("Detected file: {}", remote_path);
             let bytes = self.download_file(remote_path, local_path, options).await?;
             Ok(TransferStats {
                 total_files: 1,
@@ -83,7 +82,10 @@ impl SftpDownloader {
         local_path: &Path,
         options: &DownloadOptions,
     ) -> Result<u64> {
-        println!("Downloading: {}", remote_path);
+        let file_name = Path::new(remote_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(remote_path);
 
         // Get remote file info
         let file_info = self
@@ -93,12 +95,13 @@ impl SftpDownloader {
             .map_err(|e| AppError::FileNotFound(format!("{}: {}", remote_path, e)))?;
 
         let file_size = file_info.size.unwrap_or(0);
-        println!("File size: {}", format_bytes(file_size));
 
         // Check local file
         if local_path.exists() && !options.force && !options.resume {
             return Err(AppError::PathExists(local_path.to_path_buf()));
         }
+
+        let start = Instant::now();
 
         // Create progress bar
         let progress = create_file_progress_bar(file_size);
@@ -107,7 +110,8 @@ impl SftpDownloader {
         let mut offset = if options.resume && local_path.exists() {
             let existing_size = local_path.metadata()?.len();
             if existing_size >= file_size {
-                progress.finish_with_message("Already complete");
+                progress.finish_and_clear();
+                print_file_result(1, 1, file_name, file_size, existing_size, None);
                 return Ok(existing_size);
             }
             progress.inc(existing_size);
@@ -173,7 +177,16 @@ impl SftpDownloader {
 
         local_file.flush().await?;
         progress.finish_and_clear();
-        println!("Downloaded: {} ({})", remote_path, format_bytes(offset));
+
+        // Calculate speed
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            Some((offset as f64 / elapsed) as u64)
+        } else {
+            None
+        };
+
+        print_file_result(1, 1, file_name, file_size, offset, speed);
 
         Ok(offset)
     }
@@ -193,13 +206,8 @@ impl SftpDownloader {
         stats.total_bytes = tasks.iter().map(|t| t.file_size).sum();
 
         // Print summary
-        println!(
-            "\nTotal: {} files, {} (parallel: {})",
-            stats.total_files,
-            format_bytes(stats.total_bytes),
-            options.parallel
-        );
-        println!("{}\n", "=".repeat(60));
+        println!("\n{} files, {}, parallel: {}", stats.total_files, format_bytes(stats.total_bytes), options.parallel);
+        println!("{}", "-".repeat(60));
 
         if tasks.is_empty() {
             println!("No files to download.");
@@ -213,7 +221,7 @@ impl SftpDownloader {
         let total_pb = ProgressBar::new(stats.total_bytes);
         total_pb.set_style(
             ProgressStyle::default_bar()
-                .template("Total: [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
+                .template("[{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -267,21 +275,17 @@ impl SftpDownloader {
         }
 
         // Print final summary
-        println!("\n{}", "=".repeat(60));
+        let elapsed = stats.elapsed_secs();
+        let speed = stats.bytes_per_sec();
+        println!("{}", "-".repeat(60));
         println!(
-            "Completed: {}/{} files, {} transferred",
+            "Downloaded {}/{} files, {} in {:.2}s ({}/s)",
             stats.files_completed,
             stats.total_files,
-            format_bytes(stats.transferred_bytes)
+            format_bytes(stats.transferred_bytes),
+            elapsed,
+            format_bytes(speed as u64)
         );
-        let speed = stats.bytes_per_sec();
-        if speed > 0.0 {
-            println!(
-                "Speed: {}/s, Time: {:.2}s",
-                format_bytes(speed as u64),
-                stats.elapsed_secs()
-            );
-        }
 
         Ok(stats)
     }
@@ -395,12 +399,14 @@ async fn download_file_simple(
     if task.local_path.exists() && !force {
         let existing_size = task.local_path.metadata()?.len();
         if existing_size >= task.file_size {
-            println!("[{}/{}] {} - Skipped (exists)", idx + 1, total_files, file_name);
+            print_file_result(idx + 1, total_files, file_name, task.file_size, task.file_size, None);
             total_pb.inc(existing_size);
             files_done.fetch_add(1, Ordering::SeqCst);
             return Ok(existing_size);
         }
     }
+
+    let start = Instant::now();
 
     // Open remote file
     let mut remote_file = sftp
@@ -433,17 +439,43 @@ async fn download_file_simple(
 
     local_file.flush().await?;
 
-    // Update files done counter and message
+    // Calculate speed
+    let elapsed = start.elapsed().as_secs_f64();
+    let speed = if elapsed > 0.0 {
+        Some((total_read as f64 / elapsed) as u64)
+    } else {
+        None
+    };
+
+    // Update files done counter
     let done = files_done.fetch_add(1, Ordering::SeqCst) + 1;
     total_pb.set_message(format!("[{}/{} files]", done, total_files));
 
-    println!(
-        "[{}/{}] {} - Done ({})",
-        idx + 1,
-        total_files,
-        file_name,
-        format_bytes(total_read)
-    );
+    print_file_result(idx + 1, total_files, file_name, task.file_size, total_read, speed);
 
     Ok(total_read)
+}
+
+/// Print file download result
+fn print_file_result(current: usize, total: usize, name: &str, size: u64, transferred: u64, speed: Option<u64>) {
+    let percent = if size > 0 { (transferred * 100 / size) as usize } else { 100 };
+    let speed_str = speed.map(|s| format!("{}/s", format_bytes(s))).unwrap_or_else(|| "N/A".to_string());
+
+    println!(
+        "({}/{}) {:<30} {:>10}  {:>3}%  {}",
+        current,
+        total,
+        truncate_str(name, 30),
+        format_bytes(transferred),
+        percent,
+        speed_str
+    );
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
+    }
 }

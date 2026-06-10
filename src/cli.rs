@@ -47,11 +47,11 @@ pub struct Args {
     pub force: bool,
 
     /// Resume partial download (file only)
-    #[arg(short = 'r', long)]
+    #[arg(long)]
     pub resume: bool,
 
     /// Maximum parallel downloads for directory
-    #[arg(short = 'p', long, default_value_t = 4)]
+    #[arg(short = 'j', long, default_value_t = 4)]
     pub parallel: usize,
 }
 

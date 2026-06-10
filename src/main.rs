@@ -44,32 +44,20 @@ async fn main() -> anyhow::Result<()> {
     let downloader = SftpDownloader::new(sftp);
 
     // Auto-detect remote path type and download
-    match downloader.download_auto(&args.remote, &args.local, &DownloadOptions {
+    let stats = downloader.download_auto(&args.remote, &args.local, &DownloadOptions {
         force: args.force,
         resume: args.resume,
         parallel: args.parallel,
-    }).await {
-        Ok(stats) => {
-            if stats.total_files > 1 {
-                println!(
-                    "\nDownloaded {}/{} files, {} in {:.2}s",
-                    stats.files_completed,
-                    stats.total_files,
-                    sftp_download::progress::format_bytes(stats.transferred_bytes),
-                    stats.elapsed_secs()
-                );
-            } else {
-                println!(
-                    "\nDownloaded {} in {:.2}s",
-                    sftp_download::progress::format_bytes(stats.transferred_bytes),
-                    stats.elapsed_secs()
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    }).await?;
+
+    // Single file summary (directory summary is printed in download_directory)
+    if stats.total_files == 1 {
+        let speed = stats.bytes_per_sec();
+        println!("\nDownloaded {} in {:.2}s ({}/s)",
+            sftp_download::progress::format_bytes(stats.transferred_bytes),
+            stats.elapsed_secs(),
+            sftp_download::progress::format_bytes(speed as u64)
+        );
     }
 
     Ok(())

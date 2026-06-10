@@ -84,22 +84,28 @@ sftp-download -H server.com -u user -P password --remote /project --local ./proj
 | `--local` | `-l` | 本地保存路径 | (必需) |
 | `--force` | `-f` | 覆盖已存在文件 | false |
 | `--resume` | - | 断点续传（仅文件） | false |
-| `--parallel` | - | 并发下载数（仅目录） | 4 |
+| `--parallel` | `-j` | 并发下载数（仅目录） | 4 |
 
 ## 示例输出
 
+下载目录：
 ```
-Total: 8 files, 24.31 MiB (parallel: 4)
-============================================================
+8 files, 24.31 MiB, parallel: 4
+------------------------------------------------------------
+[===============>                       ] 12.5 MiB/24.31 MiB (3.2 MiB/s) [3/8 files]
+(1/8) 20260610_Warning.log      9.96 MiB  100%  372 KiB/s
+(2/8) 20260610_Error.log          967 KiB  100%  372 KiB/s
+(3/8) 20260610_Info.log          1.88 MiB  100%  355 KiB/s
+...
+------------------------------------------------------------
+Downloaded 8/8 files, 24.31 MiB in 7.60s (3.2 MiB/s)
+```
 
-Total: [===============>           ] 12.5 MiB/24.31 MiB (3.2 MiB/s) [3/8 files]
-[1/8] file1.log - Done (10.00 MiB)
-[2/8] file2.log - Done (5.00 MiB)
-[3/8] file3.log - Done (2.50 MiB)
+下载单个文件：
+```
+(1/1) backup.tar.gz             256.00 MiB  100%  5.2 MiB/s
 
-============================================================
-Completed: 8/8 files, 24.31 MiB transferred
-Speed: 3.2 MiB/s, Time: 7.60s
+Downloaded 256.00 MiB in 49.23s (5.2 MiB/s)
 ```
 
 ## 技术栈
