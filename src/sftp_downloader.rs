@@ -47,6 +47,35 @@ impl SftpDownloader {
         }
     }
 
+    /// Auto-detect remote path type and download
+    pub async fn download_auto(
+        &self,
+        remote_path: &str,
+        local_path: &Path,
+        options: &DownloadOptions,
+    ) -> Result<TransferStats> {
+        let metadata = self
+            .sftp
+            .metadata(remote_path)
+            .await
+            .map_err(|e| AppError::FileNotFound(format!("{}: {}", remote_path, e)))?;
+
+        if metadata.is_dir() {
+            println!("Detected directory: {}", remote_path);
+            self.download_directory(remote_path, local_path, options).await
+        } else {
+            println!("Detected file: {}", remote_path);
+            let bytes = self.download_file(remote_path, local_path, options).await?;
+            Ok(TransferStats {
+                total_files: 1,
+                files_completed: 1,
+                total_bytes: bytes,
+                transferred_bytes: bytes,
+                start_time: Some(std::time::Instant::now()),
+            })
+        }
+    }
+
     /// Download a single file
     pub async fn download_file(
         &self,

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::path::PathBuf;
 
 /// SSH/SFTP file download tool
@@ -34,49 +34,25 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
 
-    #[command(subcommand)]
-    pub command: Commands,
-}
+    /// Remote file or directory path on the server
+    #[arg(short, long)]
+    pub remote: String,
 
-#[derive(Subcommand, Debug)]
-pub enum Commands {
-    /// Download a single file
-    DownloadFile {
-        /// Remote file path on the server
-        #[arg(short, long)]
-        remote: String,
+    /// Local destination path
+    #[arg(short, long)]
+    pub local: PathBuf,
 
-        /// Local destination path (file or directory)
-        #[arg(short, long)]
-        local: PathBuf,
+    /// Overwrite existing files
+    #[arg(short, long)]
+    pub force: bool,
 
-        /// Overwrite existing files
-        #[arg(short, long)]
-        force: bool,
+    /// Resume partial download (file only)
+    #[arg(short = 'r', long)]
+    pub resume: bool,
 
-        /// Resume partial download
-        #[arg(short = 'r', long)]
-        resume: bool,
-    },
-
-    /// Download a directory recursively
-    DownloadDir {
-        /// Remote directory path on the server
-        #[arg(short, long)]
-        remote: String,
-
-        /// Local destination directory
-        #[arg(short, long)]
-        local: PathBuf,
-
-        /// Overwrite existing files
-        #[arg(short, long)]
-        force: bool,
-
-        /// Maximum parallel downloads
-        #[arg(short = 'p', long, default_value_t = 4)]
-        parallel: usize,
-    },
+    /// Maximum parallel downloads for directory
+    #[arg(short = 'p', long, default_value_t = 4)]
+    pub parallel: usize,
 }
 
 pub fn parse_args() -> Args {

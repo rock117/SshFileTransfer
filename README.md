@@ -4,6 +4,7 @@
 
 ## 功能特性
 
+- ✅ 自动检测文件/目录类型
 - ✅ 下载单个文件
 - ✅ 递归下载目录（包含子目录）
 - ✅ 支持密码认证
@@ -29,70 +30,46 @@ cargo build --release
 # 显示帮助
 cargo run -- --help
 
-# 下载单个文件（密码认证）
-cargo run -- -H 192.168.1.100 -u admin -P password download-file --remote /path/to/file.txt --local ./file.txt
+# 下载文件或目录（自动检测）
+cargo run -- -H 192.168.1.100 -u admin -P password --remote /path/to/file --local ./file
 
-# 下载目录（密钥认证）
-cargo run -- -H server.com -u user --key ~/.ssh/id_rsa download-dir --remote /data --local ./backup
-
-# 断点续传
-cargo run -- -H server.com -u user -P password download-file --remote /large/file.iso --local ./file.iso --resume
+# 下载目录并指定并发数
+cargo run -- -H server.com -u user --key ~/.ssh/id_rsa --remote /data --local ./backup --parallel 8
 ```
 
-> **说明**：`--` 分隔符告诉 cargo 后面的参数是传给程序的，而不是给 cargo 自己的。
+> **说明**：
+> - `--` 分隔符告诉 cargo 后面的参数是传给程序的
+> - 在 Git Bash 中，远程路径需要加 `MSYS_NO_PATHCONV=1` 环境变量防止路径转换
 
 ## 使用方法
 
-### 下载单个文件
+### 基本用法
 
 ```bash
-# 使用密码认证
-sftp-download -H 192.168.1.100 -u admin -P password download-file \
-    --remote /path/to/remote/file.txt \
-    --local ./local/file.txt
+# 下载文件或目录（自动检测类型）
+sftp-download -H 192.168.1.100 -u admin -P password --remote /path/to/remote --local ./local
 
-# 使用私钥认证
-sftp-download -H server.com -u user --key ~/.ssh/id_rsa download-file \
-    --remote /data/backup.tar.gz \
-    --local ./backup.tar.gz
+# 使用密钥认证
+sftp-download -H server.com -u user --key ~/.ssh/id_rsa --remote /data --local ./backup
 
-# 断点续传
-sftp-download -H server.com -u user -P password download-file \
-    --remote /large/file.iso \
-    --local ./file.iso \
-    --resume
-
-# 覆盖已存在的文件
-sftp-download -H server.com -u user -P password download-file \
-    --remote /file.txt \
-    --local ./file.txt \
-    --force
+# 使用非标准端口
+sftp-download -H server.com -p 2222 -u user -P password --remote /file --local ./file
 ```
 
-### 下载目录
+### 高级选项
 
 ```bash
-# 递归下载目录
-sftp-download -H 192.168.1.100 -u admin -P password download-dir \
-    --remote /var/www/html \
-    --local ./website_backup
-
-# 指定并发数
-sftp-download -H server.com -u user --key ~/.ssh/id_rsa download-dir \
-    --remote /project \
-    --local ./project \
-    --parallel 8
+# 断点续传（仅文件）
+sftp-download -H server.com -u user -P password --remote /large/file.iso --local ./file.iso --resume
 
 # 覆盖已存在的文件
-sftp-download -H server.com -u user -P password download-dir \
-    --remote /data \
-    --local ./data \
-    --force
+sftp-download -H server.com -u user -P password --remote /data --local ./data --force
+
+# 指定并发下载数（仅目录）
+sftp-download -H server.com -u user -P password --remote /project --local ./project --parallel 8
 ```
 
 ### 命令行参数
-
-#### 全局参数
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
@@ -103,24 +80,27 @@ sftp-download -H server.com -u user -P password download-dir \
 | `--key` | `-k` | 私钥文件路径 | - |
 | `--key-passphrase` | - | 私钥密码 | - |
 | `--timeout` | - | 连接超时(秒) | 30 |
-
-#### download-file 子命令
-
-| 参数 | 简写 | 说明 |
-|------|------|------|
-| `--remote` | `-r` | 远程文件路径 |
-| `--local` | `-l` | 本地保存路径 |
-| `--force` | `-f` | 覆盖已存在文件 |
-| `--resume` | `-r` | 断点续传 |
-
-#### download-dir 子命令
-
-| 参数 | 简写 | 说明 | 默认值 |
-|------|------|------|--------|
-| `--remote` | `-r` | 远程目录路径 | - |
-| `--local` | `-l` | 本地保存目录 | - |
+| `--remote` | `-r` | 远程文件/目录路径 | (必需) |
+| `--local` | `-l` | 本地保存路径 | (必需) |
 | `--force` | `-f` | 覆盖已存在文件 | false |
-| `--parallel` | `-p` | 并发下载数 | 4 |
+| `--resume` | - | 断点续传（仅文件） | false |
+| `--parallel` | - | 并发下载数（仅目录） | 4 |
+
+## 示例输出
+
+```
+Total: 8 files, 24.31 MiB (parallel: 4)
+============================================================
+
+Total: [===============>           ] 12.5 MiB/24.31 MiB (3.2 MiB/s) [3/8 files]
+[1/8] file1.log - Done (10.00 MiB)
+[2/8] file2.log - Done (5.00 MiB)
+[3/8] file3.log - Done (2.50 MiB)
+
+============================================================
+Completed: 8/8 files, 24.31 MiB transferred
+Speed: 3.2 MiB/s, Time: 7.60s
+```
 
 ## 技术栈
 

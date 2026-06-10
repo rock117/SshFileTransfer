@@ -1,6 +1,6 @@
 use clap::Parser;
 use sftp_download::{
-    cli::{Args, Commands},
+    cli::Args,
     sftp_downloader::{DownloadOptions, SftpDownloader},
     ssh_client::{AuthMethod, SshClient, SshConfig},
 };
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging (debug level, no log level prefix)
+    // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .without_time()
@@ -27,7 +27,6 @@ async fn main() -> anyhow::Result<()> {
     } else if let Some(password) = &args.password {
         AuthMethod::Password(password.clone())
     } else {
-        // Try to use password from env or prompt
         eprintln!("Error: Either --password or --key is required");
         std::process::exit(1);
     };
@@ -44,57 +43,32 @@ async fn main() -> anyhow::Result<()> {
     let sftp = client.open_sftp().await?;
     let downloader = SftpDownloader::new(sftp);
 
-    // Execute command
-    match &args.command {
-        Commands::DownloadFile {
-            remote,
-            local,
-            force,
-            resume,
-        } => {
-            let options = DownloadOptions {
-                force: *force,
-                resume: *resume,
-                ..Default::default()
-            };
-
-            match downloader.download_file(remote, local, &options).await {
-                Ok(bytes) => {
-                    println!("Downloaded {} bytes", bytes);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+    // Auto-detect remote path type and download
+    match downloader.download_auto(&args.remote, &args.local, &DownloadOptions {
+        force: args.force,
+        resume: args.resume,
+        parallel: args.parallel,
+    }).await {
+        Ok(stats) => {
+            if stats.total_files > 1 {
+                println!(
+                    "\nDownloaded {}/{} files, {} in {:.2}s",
+                    stats.files_completed,
+                    stats.total_files,
+                    sftp_download::progress::format_bytes(stats.transferred_bytes),
+                    stats.elapsed_secs()
+                );
+            } else {
+                println!(
+                    "\nDownloaded {} in {:.2}s",
+                    sftp_download::progress::format_bytes(stats.transferred_bytes),
+                    stats.elapsed_secs()
+                );
             }
         }
-        Commands::DownloadDir {
-            remote,
-            local,
-            force,
-            parallel,
-        } => {
-            let options = DownloadOptions {
-                force: *force,
-                resume: false,
-                parallel: *parallel,
-            };
-
-            match downloader.download_directory(remote, local, &options).await {
-                Ok(stats) => {
-                    println!(
-                        "Downloaded {}/{} files, {} bytes in {:.2}s",
-                        stats.files_completed,
-                        stats.total_files,
-                        stats.transferred_bytes,
-                        stats.elapsed_secs()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
     }
 
