@@ -3,7 +3,6 @@ use crate::progress::{format_bytes, TransferStats};
 use indicatif::{ProgressBar, ProgressStyle};
 use russh_sftp::client::SftpSession;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
@@ -217,19 +216,6 @@ impl SftpDownloader {
         // Create local directories
         self.create_local_dirs(&tasks).await?;
 
-        // Create total progress bar
-        let total_pb = ProgressBar::new(stats.total_bytes);
-        total_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        total_pb.set_message(format!("[0/{} files]", stats.total_files));
-
-        let total_pb = Arc::new(total_pb);
-        let files_done = Arc::new(AtomicU64::new(0));
-
         // Semaphore for parallel control
         let semaphore = Arc::new(Semaphore::new(options.parallel));
         let mut handles = Vec::new();
@@ -237,13 +223,11 @@ impl SftpDownloader {
         for (idx, task) in tasks.into_iter().enumerate() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let sftp = self.sftp.clone();
-            let total = total_pb.clone();
-            let done = files_done.clone();
             let total_files = stats.total_files;
             let force = options.force;
 
             let handle = tokio::spawn(async move {
-                let result = download_file_simple(&sftp, task, idx, total_files, force, total.as_ref(), done.as_ref()).await;
+                let result = download_file_simple(&sftp, task, idx, total_files, force).await;
                 drop(permit);
                 result
             });
@@ -266,8 +250,6 @@ impl SftpDownloader {
                 }
             }
         }
-
-        total_pb.finish_and_clear();
 
         // Print errors if any
         for err in &errors {
@@ -387,8 +369,6 @@ async fn download_file_simple(
     idx: usize,
     total_files: usize,
     force: bool,
-    total_pb: &ProgressBar,
-    files_done: &AtomicU64,
 ) -> Result<u64> {
     let file_name = Path::new(&task.remote_path)
         .file_name()
@@ -400,8 +380,6 @@ async fn download_file_simple(
         let existing_size = task.local_path.metadata()?.len();
         if existing_size >= task.file_size {
             print_file_result(idx + 1, total_files, file_name, task.file_size, task.file_size, None);
-            total_pb.inc(existing_size);
-            files_done.fetch_add(1, Ordering::SeqCst);
             return Ok(existing_size);
         }
     }
@@ -434,7 +412,6 @@ async fn download_file_simple(
 
         local_file.write_all(&buffer[..bytes_read]).await?;
         total_read += bytes_read as u64;
-        total_pb.inc(bytes_read as u64);
     }
 
     local_file.flush().await?;
@@ -446,10 +423,6 @@ async fn download_file_simple(
     } else {
         None
     };
-
-    // Update files done counter
-    let done = files_done.fetch_add(1, Ordering::SeqCst) + 1;
-    total_pb.set_message(format!("[{}/{} files]", done, total_files));
 
     print_file_result(idx + 1, total_files, file_name, task.file_size, total_read, speed);
 
