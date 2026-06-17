@@ -2,12 +2,13 @@ use crate::error::{AppError, Result};
 use crate::progress::{format_bytes, TransferStats};
 use indicatif::{ProgressBar, ProgressStyle};
 use russh_sftp::client::SftpSession;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 
 /// Download options
 #[derive(Debug, Clone)]
@@ -25,6 +26,15 @@ impl Default for DownloadOptions {
             parallel: 4,
         }
     }
+}
+
+/// File download result for ordered printing
+struct FileResult {
+    idx: usize,
+    file_name: String,
+    size: u64,
+    transferred: u64,
+    speed: Option<u64>,
 }
 
 /// Download task
@@ -220,6 +230,13 @@ impl SftpDownloader {
         // Create local directories
         self.create_local_dirs(&tasks).await?;
 
+        // Channel for ordered printing
+        let (tx, rx) = mpsc::unbounded_channel::<FileResult>();
+        let total_files = stats.total_files;
+        let printer_handle = tokio::spawn(async move {
+            printer_task(rx, total_files).await;
+        });
+
         // Semaphore for parallel control
         let semaphore = Arc::new(Semaphore::new(options.parallel));
         let mut handles = Vec::new();
@@ -227,16 +244,25 @@ impl SftpDownloader {
         for (idx, task) in tasks.into_iter().enumerate() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let sftp = self.sftp.clone();
-            let total_files = stats.total_files;
             let skip_existing = options.skip_existing;
+            let tx = tx.clone();
 
             let handle = tokio::spawn(async move {
-                let result = download_file_simple(&sftp, task, idx, total_files, skip_existing).await;
+                let result = download_file_simple(&sftp, task, idx, skip_existing).await;
                 drop(permit);
-                result
+                match result {
+                    Ok((bytes, file_result)) => {
+                        let _ = tx.send(file_result);
+                        Ok(bytes)
+                    }
+                    Err(e) => Err(e),
+                }
             });
             handles.push(handle);
         }
+
+        // Drop the original tx so printer_task exits when all spawned tasks finish
+        drop(tx);
 
         // Wait for all downloads
         let mut errors = Vec::new();
@@ -254,6 +280,9 @@ impl SftpDownloader {
                 }
             }
         }
+
+        // Wait for printer to flush all output
+        let _ = printer_handle.await;
 
         // Print errors if any
         for err in &errors {
@@ -366,25 +395,30 @@ fn create_file_progress_bar(size: u64) -> ProgressBar {
     pb
 }
 
-/// Download file with simple progress update
+/// Download file, return bytes transferred and result info for ordered printing
 async fn download_file_simple(
     sftp: &SftpSession,
     task: DownloadTask,
     idx: usize,
-    total_files: usize,
     skip_existing: bool,
-) -> Result<u64> {
+) -> Result<(u64, FileResult)> {
     let file_name = Path::new(&task.remote_path)
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(&task.remote_path);
+        .unwrap_or(&task.remote_path)
+        .to_string();
 
     // Check if file exists and should skip
     if skip_existing && task.local_path.exists() {
         let existing_size = task.local_path.metadata()?.len();
         if existing_size >= task.file_size {
-            print_file_result(idx + 1, total_files, file_name, task.file_size, task.file_size, None);
-            return Ok(existing_size);
+            return Ok((existing_size, FileResult {
+                idx,
+                file_name,
+                size: task.file_size,
+                transferred: task.file_size,
+                speed: None,
+            }));
         }
     }
 
@@ -420,7 +454,6 @@ async fn download_file_simple(
 
     local_file.flush().await?;
 
-    // Calculate speed
     let elapsed = start.elapsed().as_secs_f64();
     let speed = if elapsed > 0.0 {
         Some((total_read as f64 / elapsed) as u64)
@@ -428,9 +461,27 @@ async fn download_file_simple(
         None
     };
 
-    print_file_result(idx + 1, total_files, file_name, task.file_size, total_read, speed);
+    Ok((total_read, FileResult {
+        idx,
+        file_name,
+        size: task.file_size,
+        transferred: total_read,
+        speed,
+    }))
+}
 
-    Ok(total_read)
+/// Receive file results and print them in order
+async fn printer_task(mut rx: mpsc::UnboundedReceiver<FileResult>, total_files: usize) {
+    let mut next = 0usize;
+    let mut pending: HashMap<usize, FileResult> = HashMap::new();
+
+    while let Some(result) = rx.recv().await {
+        pending.insert(result.idx, result);
+        while let Some(info) = pending.remove(&next) {
+            print_file_result(next + 1, total_files, &info.file_name, info.size, info.transferred, info.speed);
+            next += 1;
+        }
+    }
 }
 
 /// Print file download result
