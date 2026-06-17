@@ -1,14 +1,13 @@
 use crate::error::{AppError, Result};
 use crate::progress::{format_bytes, TransferStats};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use russh_sftp::client::SftpSession;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 
 /// Download options
 #[derive(Debug, Clone)]
@@ -26,15 +25,6 @@ impl Default for DownloadOptions {
             parallel: 4,
         }
     }
-}
-
-/// File download result for ordered printing
-struct FileResult {
-    idx: usize,
-    file_name: String,
-    size: u64,
-    transferred: u64,
-    speed: Option<u64>,
 }
 
 /// Download task
@@ -230,39 +220,49 @@ impl SftpDownloader {
         // Create local directories
         self.create_local_dirs(&tasks).await?;
 
-        // Channel for ordered printing
-        let (tx, rx) = mpsc::unbounded_channel::<FileResult>();
         let total_files = stats.total_files;
-        let printer_handle = tokio::spawn(async move {
-            printer_task(rx, total_files).await;
-        });
+
+        // Active style: shows real-time progress bar
+        let active_style = ProgressStyle::default_bar()
+            .template("{prefix} [{bar:22.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec}")
+            .unwrap()
+            .progress_chars("=>-");
+
+        // Done style: plain message replacing the bar
+        let done_style = ProgressStyle::default_bar()
+            .template("{msg}")
+            .unwrap();
+
+        // Pre-create all progress bars in index order so display order is fixed
+        let mp = MultiProgress::new();
+        let bars: Vec<ProgressBar> = tasks.iter().enumerate().map(|(idx, task)| {
+            let name = Path::new(&task.remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&task.remote_path);
+            let pb = mp.add(ProgressBar::new(task.file_size));
+            pb.set_style(active_style.clone());
+            pb.set_prefix(format!("({}/{}) {:<28}", idx + 1, total_files, truncate_str(name, 28)));
+            pb
+        }).collect();
 
         // Semaphore for parallel control
         let semaphore = Arc::new(Semaphore::new(options.parallel));
         let mut handles = Vec::new();
 
-        for (idx, task) in tasks.into_iter().enumerate() {
+        for (task, pb) in tasks.into_iter().zip(bars) {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let sftp = self.sftp.clone();
             let skip_existing = options.skip_existing;
-            let tx = tx.clone();
+            let done_style = done_style.clone();
 
             let handle = tokio::spawn(async move {
-                let result = download_file_simple(&sftp, task, idx, skip_existing).await;
+                let result = download_file_simple(&sftp, task, skip_existing, pb, done_style, total_files).await;
                 drop(permit);
-                match result {
-                    Ok((bytes, file_result)) => {
-                        let _ = tx.send(file_result);
-                        Ok(bytes)
-                    }
-                    Err(e) => Err(e),
-                }
+                result
             });
             handles.push(handle);
         }
-
-        // Drop the original tx so printer_task exits when all spawned tasks finish
-        drop(tx);
 
         // Wait for all downloads
         let mut errors = Vec::new();
@@ -281,12 +281,9 @@ impl SftpDownloader {
             }
         }
 
-        // Wait for printer to flush all output
-        let _ = printer_handle.await;
-
         // Print errors if any
         for err in &errors {
-            println!("Error: {}", err);
+            eprintln!("Error: {}", err);
         }
 
         // Print final summary
@@ -395,30 +392,40 @@ fn create_file_progress_bar(size: u64) -> ProgressBar {
     pb
 }
 
-/// Download file, return bytes transferred and result info for ordered printing
+/// Download file with real-time progress bar; finish bar with final stats line
 async fn download_file_simple(
     sftp: &SftpSession,
     task: DownloadTask,
-    idx: usize,
     skip_existing: bool,
-) -> Result<(u64, FileResult)> {
-    let file_name = Path::new(&task.remote_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&task.remote_path)
-        .to_string();
+    pb: ProgressBar,
+    done_style: ProgressStyle,
+    total_files: usize,
+) -> Result<u64> {
+    // The (idx/total) name prefix was set when the bar was created; reuse it for the done line
+    let prefix = pb.prefix();
 
-    // Check if file exists and should skip
+    let finish = |transferred: u64, speed: Option<u64>| {
+        let size = task.file_size;
+        let percent = if size > 0 { transferred * 100 / size } else { 100 };
+        let speed_str = speed
+            .map(|s| format!("{}/s", format_bytes(s)))
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "{} {:>10}  {:>3}%  {}",
+            prefix,
+            format_bytes(transferred),
+            percent,
+            speed_str,
+        )
+    };
+
+    // Skip if already exists
     if skip_existing && task.local_path.exists() {
         let existing_size = task.local_path.metadata()?.len();
         if existing_size >= task.file_size {
-            return Ok((existing_size, FileResult {
-                idx,
-                file_name,
-                size: task.file_size,
-                transferred: task.file_size,
-                speed: None,
-            }));
+            pb.set_style(done_style);
+            pb.finish_with_message(finish(task.file_size, None));
+            return Ok(existing_size);
         }
     }
 
@@ -433,7 +440,6 @@ async fn download_file_simple(
     // Create local file
     let mut local_file = tokio::fs::File::create(&task.local_path).await?;
 
-    // Download
     let chunk_size = 64 * 1024;
     let mut buffer = vec![0u8; chunk_size];
     let mut total_read: u64 = 0;
@@ -450,6 +456,7 @@ async fn download_file_simple(
 
         local_file.write_all(&buffer[..bytes_read]).await?;
         total_read += bytes_read as u64;
+        pb.inc(bytes_read as u64);
     }
 
     local_file.flush().await?;
@@ -461,27 +468,13 @@ async fn download_file_simple(
         None
     };
 
-    Ok((total_read, FileResult {
-        idx,
-        file_name,
-        size: task.file_size,
-        transferred: total_read,
-        speed,
-    }))
-}
+    pb.set_style(done_style);
+    pb.finish_with_message(finish(total_read, speed));
 
-/// Receive file results and print them in order
-async fn printer_task(mut rx: mpsc::UnboundedReceiver<FileResult>, total_files: usize) {
-    let mut next = 0usize;
-    let mut pending: HashMap<usize, FileResult> = HashMap::new();
+    // Suppress unused warning; total_files kept for potential future use
+    let _ = total_files;
 
-    while let Some(result) = rx.recv().await {
-        pending.insert(result.idx, result);
-        while let Some(info) = pending.remove(&next) {
-            print_file_result(next + 1, total_files, &info.file_name, info.size, info.transferred, info.speed);
-            next += 1;
-        }
-    }
+    Ok(total_read)
 }
 
 /// Print file download result
