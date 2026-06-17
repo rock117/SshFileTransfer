@@ -233,31 +233,32 @@ impl SftpDownloader {
             .template("{msg}")
             .unwrap();
 
-        // Pre-create all progress bars in index order so display order is fixed
         let mp = MultiProgress::new();
-        let bars: Vec<ProgressBar> = tasks.iter().enumerate().map(|(idx, task)| {
-            let name = Path::new(&task.remote_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&task.remote_path);
-            let pb = mp.add(ProgressBar::new(task.file_size));
-            pb.set_style(active_style.clone());
-            pb.set_prefix(format!("({}/{}) {:<28}", idx + 1, total_files, truncate_str(name, 28)));
-            pb
-        }).collect();
 
         // Semaphore for parallel control
         let semaphore = Arc::new(Semaphore::new(options.parallel));
         let mut handles = Vec::new();
 
-        for (task, pb) in tasks.into_iter().zip(bars) {
+        for (idx, task) in tasks.into_iter().enumerate() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let sftp = self.sftp.clone();
             let skip_existing = options.skip_existing;
+            let mp = mp.clone();
+            let active_style = active_style.clone();
             let done_style = done_style.clone();
 
             let handle = tokio::spawn(async move {
-                let result = download_file_simple(&sftp, task, skip_existing, pb, done_style, total_files).await;
+                let result = download_file_simple(
+                    &sftp,
+                    task,
+                    idx,
+                    skip_existing,
+                    &mp,
+                    active_style,
+                    done_style,
+                    total_files,
+                )
+                .await;
                 drop(permit);
                 result
             });
@@ -396,13 +397,27 @@ fn create_file_progress_bar(size: u64) -> ProgressBar {
 async fn download_file_simple(
     sftp: &SftpSession,
     task: DownloadTask,
+    idx: usize,
     skip_existing: bool,
-    pb: ProgressBar,
+    mp: &MultiProgress,
+    active_style: ProgressStyle,
     done_style: ProgressStyle,
     total_files: usize,
 ) -> Result<u64> {
-    // The (idx/total) name prefix was set when the bar was created; reuse it for the done line
-    let prefix = pb.prefix();
+    let file_name = Path::new(&task.remote_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&task.remote_path);
+    let prefix = format!(
+        "({}/{}) {:<28}",
+        idx + 1,
+        total_files,
+        truncate_str(file_name, 28)
+    );
+
+    let pb = mp.add(ProgressBar::new(task.file_size));
+    pb.set_style(active_style);
+    pb.set_prefix(prefix.clone());
 
     let finish = |transferred: u64, speed: Option<u64>| {
         let size = task.file_size;
@@ -470,9 +485,6 @@ async fn download_file_simple(
 
     pb.set_style(done_style);
     pb.finish_with_message(finish(total_read, speed));
-
-    // Suppress unused warning; total_files kept for potential future use
-    let _ = total_files;
 
     Ok(total_read)
 }
