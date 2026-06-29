@@ -61,9 +61,21 @@ pub struct Args {
     #[arg(short = 'j', long)]
     pub parallel: Option<usize>,
 
-    /// Exclude file extensions (repeatable, e.g. --exclude log --exclude .tmp)
-    #[arg(short = 'x', long = "exclude", value_name = "EXT")]
+    /// Exclude files matching a glob pattern on the basename
+    /// (repeatable, e.g. --exclude "*.log" --exclude "*~").
+    /// Applied after --include: trims files that match any of these patterns.
+    #[arg(short = 'x', long = "exclude", value_name = "PATTERN")]
     pub exclude: Option<Vec<String>>,
+
+    /// Only download files matching a glob pattern on the basename
+    /// (repeatable, e.g. --include "*.log" --include "*.txt").
+    /// If non-empty, files not matching any pattern are skipped.
+    #[arg(short = 'i', long = "include", value_name = "PATTERN")]
+    pub include: Option<Vec<String>>,
+
+    /// Case-insensitive matching for --include/--exclude patterns (default: case-sensitive)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub ignore_case: Option<bool>,
 
     /// Only download files modified on or after this date (e.g. "2026-06-01" or "2026-06-01 12:00:00")
     #[arg(long, value_name = "DATE")]
@@ -95,6 +107,8 @@ pub struct FileConfig {
     pub resume: Option<bool>,
     pub parallel: Option<usize>,
     pub exclude: Option<Vec<String>>,
+    pub include: Option<Vec<String>>,
+    pub ignore_case: Option<bool>,
     pub since: Option<String>,
     pub until: Option<String>,
     pub latest: Option<usize>,
@@ -137,6 +151,8 @@ pub struct ResolvedArgs {
     pub resume: bool,
     pub parallel: usize,
     pub exclude: Vec<String>,
+    pub include: Vec<String>,
+    pub ignore_case: bool,
     /// Lower-bound mtime (inclusive), as Unix seconds in UTC.
     pub since: Option<i64>,
     /// Upper-bound mtime (inclusive), as Unix seconds in UTC.
@@ -175,8 +191,14 @@ impl ResolvedArgs {
             parts.push("--resume".to_string());
         }
         parts.push(format!("-j {}", self.parallel));
-        for ext in &self.exclude {
-            parts.push(format!("-x {}", shell_escape(ext)));
+        for p in &self.exclude {
+            parts.push(format!("-x {}", shell_escape(p)));
+        }
+        for p in &self.include {
+            parts.push(format!("-i {}", shell_escape(p)));
+        }
+        if self.ignore_case {
+            parts.push("--ignore-case".to_string());
         }
         if let Some(s) = self.since {
             parts.push(format!("--since {}", shell_escape(&format_unix_as_date(s))));
@@ -266,6 +288,8 @@ pub fn parse_args() -> ResolvedArgs {
     let timeout = args.timeout.or(cfg.timeout).unwrap_or(30);
     let parallel = args.parallel.or(cfg.parallel).unwrap_or(4);
     let exclude = args.exclude.or(cfg.exclude).unwrap_or_default();
+    let include = args.include.or(cfg.include).unwrap_or_default();
+    let ignore_case = args.ignore_case.or(cfg.ignore_case).unwrap_or(false);
     let skip = args.skip.or(cfg.skip).unwrap_or(false);
     let resume = args.resume.or(cfg.resume).unwrap_or(false);
 
@@ -349,6 +373,8 @@ pub fn parse_args() -> ResolvedArgs {
         resume,
         parallel,
         exclude,
+        include,
+        ignore_case,
         since,
         until,
         latest,

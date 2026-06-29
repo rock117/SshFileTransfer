@@ -9,7 +9,9 @@
   "timeout": 30,
   "skip": false,
   "resume": false,
-  "exclude": ["log", "tmp"],
+  "ignore_case": false,
+  "exclude": ["*.log", "*.tmp"],
+  "include": [],
   "since": null,
   "until": null,
   "latest": null

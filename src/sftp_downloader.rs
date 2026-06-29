@@ -16,12 +16,17 @@ pub struct DownloadOptions {
     pub skip_existing: bool,
     pub resume: bool,
     pub parallel: usize,
-    pub exclude_extensions: Vec<String>,
+    /// Glob patterns matched against file basename; any match -> excluded.
+    pub exclude_patterns: Vec<String>,
+    /// Glob patterns matched against file basename; if non-empty, only matches are kept.
+    pub include_patterns: Vec<String>,
+    /// Case-insensitive glob matching when true.
+    pub ignore_case: bool,
     /// Lower-bound mtime (inclusive), Unix seconds UTC. None = no lower bound.
     pub since: Option<i64>,
     /// Upper-bound mtime (inclusive), Unix seconds UTC. None = no upper bound.
     pub until: Option<i64>,
-    /// Keep only the N most recently modified files (applied after since/until/exclude).
+    /// Keep only the N most recently modified files (applied after include/exclude/since/until).
     pub latest: Option<usize>,
 }
 
@@ -31,7 +36,9 @@ impl Default for DownloadOptions {
             skip_existing: false,
             resume: false,
             parallel: 4,
-            exclude_extensions: Vec::new(),
+            exclude_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            ignore_case: false,
             since: None,
             until: None,
             latest: None,
@@ -81,7 +88,14 @@ impl SftpDownloader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(remote_path);
-            if is_excluded(file_name, &options.exclude_extensions) {
+            // Include (whitelist) applied first, then exclude (blacklist) trims it.
+            if !options.include_patterns.is_empty()
+                && !matches_any_glob(file_name, &options.include_patterns, options.ignore_case)
+            {
+                println!("Skipped (not in include patterns): {}", remote_path);
+                return Ok(TransferStats::new());
+            }
+            if matches_any_glob(file_name, &options.exclude_patterns, options.ignore_case) {
                 println!("Skipped (excluded): {}", remote_path);
                 return Ok(TransferStats::new());
             }
@@ -234,14 +248,7 @@ impl SftpDownloader {
 
         // Collect all files to download
         let tasks = self
-            .collect_tasks(
-                remote_dir,
-                local_dir,
-                &options.exclude_extensions,
-                options.since,
-                options.until,
-                options.latest,
-            )
+            .collect_tasks(remote_dir, local_dir, options)
             .await?;
         stats.total_files = tasks.len();
         stats.total_bytes = tasks.iter().map(|t| t.file_size).sum();
@@ -351,10 +358,7 @@ impl SftpDownloader {
         &self,
         remote_dir: &str,
         local_dir: &Path,
-        exclude_extensions: &[String],
-        since: Option<i64>,
-        until: Option<i64>,
-        latest: Option<usize>,
+        options: &DownloadOptions,
     ) -> Result<Vec<DownloadTask>> {
         let mut tasks = Vec::new();
         // Normalize remote_dir: ensure it doesn't end with '/'
@@ -397,14 +401,21 @@ impl SftpDownloader {
 
                 if stat.is_dir() {
                     dirs_to_visit.push(full_path);
-                } else if is_excluded(&file_name, exclude_extensions) {
-                    continue;
                 } else {
+                    // Include (whitelist) applied first, then exclude (blacklist) trims it.
+                    if !options.include_patterns.is_empty()
+                        && !matches_any_glob(&file_name, &options.include_patterns, options.ignore_case)
+                    {
+                        continue;
+                    }
+                    if matches_any_glob(&file_name, &options.exclude_patterns, options.ignore_case) {
+                        continue;
+                    }
                     let file_size = stat.size.unwrap_or(0);
                     let mtime = stat.mtime.map(|v| v as i64);
                     // Apply time filter at collect time so latest-N sees only matching files.
                     if let Some(mt) = mtime {
-                        if !mtime_in_range(mt, since, until) {
+                        if !mtime_in_range(mt, options.since, options.until) {
                             continue;
                         }
                     }
@@ -419,7 +430,7 @@ impl SftpDownloader {
         }
 
         // Apply --latest: keep only the N most recently modified files (mtime desc).
-        if let Some(n) = latest {
+        if let Some(n) = options.latest {
             if n == 0 {
                 tasks.clear();
             } else if tasks.len() > n {
@@ -608,26 +619,128 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-fn normalize_extension(ext: &str) -> String {
-    ext.trim_start_matches('.').to_lowercase()
+/// Test whether `name` matches any of the glob `patterns`.
+/// Supports `*` (any sequence, including empty), `?` (single char), and `[...]` (char set).
+/// `ignore_case` makes the match case-insensitive for ASCII letters.
+fn matches_any_glob(name: &str, patterns: &[String], ignore_case: bool) -> bool {
+    patterns
+        .iter()
+        .any(|p| glob_match(name, p, ignore_case))
 }
 
-fn is_excluded(file_name: &str, exclude_extensions: &[String]) -> bool {
-    if exclude_extensions.is_empty() {
-        return false;
+/// Recursive glob matcher: pattern vs name.
+/// Supports `*` (greedy, spans any chars including none), `?` (one char), `[abc]` / `[!abc]`.
+fn glob_match(name: &str, pattern: &str, ignore_case: bool) -> bool {
+    // ASCII-lowercase helper used for case-insensitive comparison.
+    #[inline]
+    fn norm(c: char, ignore_case: bool) -> char {
+        if ignore_case {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        }
     }
 
-    let Some(file_ext) = Path::new(file_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(normalize_extension)
-    else {
-        return false;
-    };
+    let name_chars: Vec<char> = name.chars().map(|c| norm(c, ignore_case)).collect();
+    let pattern_chars: Vec<char> = pattern.chars().map(|c| norm(c, ignore_case)).collect();
+    glob_match_recursive(&name_chars, 0, &pattern_chars, 0)
+}
 
-    exclude_extensions
-        .iter()
-        .any(|ext| normalize_extension(ext) == file_ext)
+/// Backtracking glob matcher. `*` is the only backtracking point.
+fn glob_match_recursive(
+    name: &[char],
+    mut ni: usize,
+    pattern: &[char],
+    mut pi: usize,
+) -> bool {
+    while pi < pattern.len() {
+        match pattern[pi] {
+            '*' => {
+                // Collapse consecutive '*' into one.
+                while pi < pattern.len() && pattern[pi] == '*' {
+                    pi += 1;
+                }
+                if pi == pattern.len() {
+                    return true; // trailing '*' matches the rest
+                }
+                // Try every remaining position in name as the start of the next pattern segment.
+                while ni <= name.len() {
+                    if glob_match_recursive(name, ni, pattern, pi) {
+                        return true;
+                    }
+                    if ni == name.len() {
+                        break;
+                    }
+                    ni += 1;
+                }
+                return false;
+            }
+            '?' => {
+                if ni >= name.len() {
+                    return false;
+                }
+                ni += 1;
+                pi += 1;
+            }
+            '[' => {
+                if ni >= name.len() {
+                    return false;
+                }
+                // Character class: [...] or [!...]
+                let mut negate = false;
+                let mut j = pi + 1;
+                if j < pattern.len() && (pattern[j] == '!' || pattern[j] == '^') {
+                    negate = true;
+                    j += 1;
+                }
+                let mut matched = false;
+                // Closing ']' as first char is treated literally.
+                let mut first = true;
+                while j < pattern.len() {
+                    if pattern[j] == ']' && !first {
+                        break;
+                    }
+                    first = false;
+                    // Range a-z?
+                    if j + 2 < pattern.len() && pattern[j + 1] == '-' && pattern[j + 2] != ']' {
+                        let lo = pattern[j];
+                        let hi = pattern[j + 2];
+                        if name[ni] >= lo && name[ni] <= hi {
+                            matched = true;
+                        }
+                        j += 3;
+                    } else {
+                        if pattern[j] == name[ni] {
+                            matched = true;
+                        }
+                        j += 1;
+                    }
+                }
+                if j >= pattern.len() {
+                    // Unterminated '[': treat literally as '['.
+                    if (name[ni] == '[') != negate {
+                        ni += 1;
+                        pi += 1;
+                        continue;
+                    }
+                    return false;
+                }
+                if matched == negate {
+                    return false;
+                }
+                ni += 1;
+                pi = j + 1; // skip past ']'
+            }
+            c => {
+                if ni >= name.len() || name[ni] != c {
+                    return false;
+                }
+                ni += 1;
+                pi += 1;
+            }
+        }
+    }
+    ni == name.len()
 }
 
 /// Check whether a file mtime (Unix seconds) falls within [since, until].
@@ -645,4 +758,164 @@ fn mtime_in_range(mtime: i64, since: Option<i64>, until: Option<i64>) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_basic_star() {
+        assert!(glob_match("app.log", "*.log", false));
+        assert!(glob_match("app.log", "*", false));
+        assert!(!glob_match("app.log", "*.txt", false));
+        // '*' matches empty sequence.
+        assert!(glob_match("app", "app*", false));
+        assert!(glob_match("app", "*app", false));
+        assert!(glob_match("app", "a*p", false));
+    }
+
+    #[test]
+    fn glob_question_mark() {
+        assert!(glob_match("app.log", "app.log", false));
+        assert!(glob_match("app.log", "??p.log", false));
+        assert!(!glob_match("app.log", "?.log", false));
+        assert!(glob_match("a", "?", false));
+        assert!(!glob_match("", "?", false));
+    }
+
+    #[test]
+    fn glob_char_class() {
+        assert!(glob_match("app.log", "app.[lj]og", false));
+        assert!(!glob_match("app.kog", "app.[lj]og", false));
+        // Range.
+        assert!(glob_match("app.log", "app.[a-z]og", false));
+        assert!(!glob_match("app.Log", "app.[a-z]og", false));
+        // Negated class.
+        assert!(glob_match("app.kog", "app.[!lj]og", false));
+        assert!(!glob_match("app.log", "app.[!lj]og", false));
+    }
+
+    #[test]
+    fn glob_ignore_case() {
+        assert!(!glob_match("app.LOG", "*.log", false));
+        assert!(glob_match("app.LOG", "*.log", true));
+        assert!(glob_match("App.Log", "app.log", true));
+        assert!(glob_match("APP.LOG", "???.LOG", true));
+        // `?` matches exactly one char.
+        assert!(!glob_match("APP.LOG", "?.LOG", true));
+    }
+
+    #[test]
+    fn glob_multiple_stars() {
+        assert!(glob_match("dir/app.log", "*app.log", false)); // '*' spans 'dir/'
+        assert!(glob_match("app.log.bak", "app*.bak", false));
+        assert!(glob_match("app.log.bak", "*log*bak", false));
+        assert!(!glob_match("app.log", "*log.tmp", false));
+    }
+
+    #[test]
+    fn glob_no_extension_file() {
+        assert!(glob_match("README", "README", false));
+        assert!(glob_match("README", "*", false));
+        assert!(!glob_match("README", "*.log", false));
+        assert!(glob_match("README", "READ*", false));
+    }
+
+    #[test]
+    fn glob_empty_pattern() {
+        assert!(glob_match("", "", false));
+        assert!(glob_match("", "*", false));
+        assert!(!glob_match("a", "", false));
+    }
+
+    #[test]
+    fn matches_any_glob_works() {
+        let pats = vec!["*.log".to_string(), "*.txt".to_string()];
+        assert!(matches_any_glob("app.log", &pats, false));
+        assert!(matches_any_glob("app.txt", &pats, false));
+        assert!(!matches_any_glob("app.tmp", &pats, false));
+        // Empty patterns -> no match.
+        assert!(!matches_any_glob("app.log", &[], false));
+    }
+
+    #[test]
+    fn include_whitelist_semantics() {
+        let include = vec!["*.log".to_string(), "*.txt".to_string()];
+        // Matches one of the patterns -> kept.
+        assert!(matches_any_glob("app.log", &include, false));
+        assert!(matches_any_glob("notes.txt", &include, false));
+        // No match -> would be skipped by whitelist.
+        assert!(!matches_any_glob("app.tmp", &include, false));
+        assert!(!matches_any_glob("README", &include, false));
+        assert!(!matches_any_glob("archive.tar.gz", &include, false));
+    }
+
+    #[test]
+    fn exclude_blacklist_semantics() {
+        let exclude = vec!["*.tmp".to_string(), "*~".to_string()];
+        // Matches -> would be excluded.
+        assert!(matches_any_glob("build.tmp", &exclude, false));
+        assert!(matches_any_glob("app.log~", &exclude, false));
+        assert!(matches_any_glob("~", &exclude, false));
+        // No match -> kept.
+        assert!(!matches_any_glob("app.log", &exclude, false));
+        assert!(!matches_any_glob("README", &exclude, false));
+    }
+
+    #[test]
+    fn include_then_exclude_subset() {
+        // Simulate the actual filter pipeline:
+        //   include=*.log  -> {app.log, debug.log}
+        //   exclude=debug* -> trims debug.log
+        // Final: {app.log}
+        let include = vec!["*.log".to_string()];
+        let exclude = vec!["debug*".to_string()];
+
+        // app.log: passes include, not excluded -> downloaded.
+        assert!(matches_any_glob("app.log", &include, false));
+        assert!(!matches_any_glob("app.log", &exclude, false));
+        // debug.log: passes include, then excluded -> skipped.
+        assert!(matches_any_glob("debug.log", &include, false));
+        assert!(matches_any_glob("debug.log", &exclude, false));
+        // app.txt: fails include -> skipped (exclude never consulted).
+        assert!(!matches_any_glob("app.txt", &include, false));
+    }
+
+    #[test]
+    fn ignore_case_affects_matching() {
+        let pats = vec!["*.LOG".to_string()];
+        // Case-sensitive: mismatched case -> no match.
+        assert!(!matches_any_glob("app.log", &pats, false));
+        assert!(matches_any_glob("app.LOG", &pats, false));
+        // Case-insensitive: both match.
+        assert!(matches_any_glob("app.log", &pats, true));
+        assert!(matches_any_glob("app.LOG", &pats, true));
+        assert!(matches_any_glob("App.Log", &pats, true));
+    }
+
+    #[test]
+    fn empty_include_keeps_all() {
+        // Empty include list -> matches_any_glob returns false,
+        // which the caller interprets as "no whitelist active" (keep all).
+        assert!(!matches_any_glob("anything.log", &[], false));
+        assert!(!matches_any_glob("README", &[], false));
+    }
+
+    #[test]
+    fn empty_exclude_excludes_none() {
+        // Empty exclude list -> nothing matches -> nothing excluded.
+        assert!(!matches_any_glob("anything.log", &[], false));
+        assert!(!matches_any_glob("debug.log", &[], false));
+    }
+
+    #[test]
+    fn no_extension_file_handling() {
+        // No-extension files: only match patterns that don't require a dot ext.
+        let include = vec!["*.log".to_string()];
+        assert!(!matches_any_glob("README", &include, false)); // not whitelisted
+        assert!(matches_any_glob("README", &["README".to_string()], false)); // exact match
+        assert!(matches_any_glob("README", &["*".to_string()], false)); // wildcard
+        assert!(matches_any_glob("README", &["READ*".to_string()], false)); // prefix
+    }
 }
