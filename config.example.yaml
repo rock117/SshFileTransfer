@@ -16,3 +16,7 @@ resume: false
 exclude:
   - log
   - tmp
+# Time-based filters (optional). Accept "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS".
+# since: "2026-06-01"        # only files modified on/after this date
+# until: "2026-06-29"        # only files modified on/before this date (end of day)
+# latest: 10                 # keep only the N most recently modified files

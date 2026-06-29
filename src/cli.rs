@@ -1,5 +1,6 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use clap::{ArgAction, Parser};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// SSH/SFTP file download tool
@@ -63,10 +64,22 @@ pub struct Args {
     /// Exclude file extensions (repeatable, e.g. --exclude log --exclude .tmp)
     #[arg(short = 'x', long = "exclude", value_name = "EXT")]
     pub exclude: Option<Vec<String>>,
+
+    /// Only download files modified on or after this date (e.g. "2026-06-01" or "2026-06-01 12:00:00")
+    #[arg(long, value_name = "DATE")]
+    pub since: Option<String>,
+
+    /// Only download files modified on or before this date (e.g. "2026-06-29" or "2026-06-29 23:59:59")
+    #[arg(long, value_name = "DATE")]
+    pub until: Option<String>,
+
+    /// Only download the N most recently modified files (mtime descending)
+    #[arg(long, value_name = "N")]
+    pub latest: Option<usize>,
 }
 
 /// Config file content. All fields optional to allow partial configs.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FileConfig {
     pub host: Option<String>,
@@ -82,6 +95,9 @@ pub struct FileConfig {
     pub resume: Option<bool>,
     pub parallel: Option<usize>,
     pub exclude: Option<Vec<String>>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub latest: Option<usize>,
 }
 
 impl FileConfig {
@@ -121,6 +137,12 @@ pub struct ResolvedArgs {
     pub resume: bool,
     pub parallel: usize,
     pub exclude: Vec<String>,
+    /// Lower-bound mtime (inclusive), as Unix seconds in UTC.
+    pub since: Option<i64>,
+    /// Upper-bound mtime (inclusive), as Unix seconds in UTC.
+    pub until: Option<i64>,
+    /// Keep only the N most recently modified files (applied after since/until).
+    pub latest: Option<usize>,
 }
 
 impl ResolvedArgs {
@@ -156,6 +178,15 @@ impl ResolvedArgs {
         for ext in &self.exclude {
             parts.push(format!("-x {}", shell_escape(ext)));
         }
+        if let Some(s) = self.since {
+            parts.push(format!("--since {}", shell_escape(&format_unix_as_date(s))));
+        }
+        if let Some(u) = self.until {
+            parts.push(format!("--until {}", shell_escape(&format_unix_as_date(u))));
+        }
+        if let Some(n) = self.latest {
+            parts.push(format!("--latest {n}"));
+        }
 
         parts.join(" ")
     }
@@ -178,6 +209,40 @@ fn shell_escape(s: &str) -> String {
         let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
     }
+}
+
+/// Parse a user-supplied date/datetime string into a Unix timestamp (UTC seconds).
+/// Accepted formats:
+///   "YYYY-MM-DD"               -> start-of-day (00:00:00) for --since, end-of-day (23:59:59) for --until
+///   "YYYY-MM-DD HH:MM:SS"      -> exact second
+///   "YYYY-MM-DDTHH:MM:SS"      -> exact second (ISO 8601)
+/// `end_of_day` controls how a bare date is interpreted:
+///   true  -> 23:59:59 (used for --until, inclusive upper bound)
+///   false -> 00:00:00 (used for --since, inclusive lower bound)
+fn parse_date_arg(s: &str, end_of_day: bool) -> anyhow::Result<i64> {
+    let s = s.trim();
+    // Try full datetime first (space- or T-separated).
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+    {
+        return Ok(dt.and_utc().timestamp());
+    }
+    // Fall back to date only.
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid date '{s}': {e}. Expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"))?;
+    let t = if end_of_day {
+        NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+    } else {
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+    };
+    Ok(d.and_time(t).and_utc().timestamp())
+}
+
+/// Render a Unix timestamp (UTC seconds) back to "YYYY-MM-DD HH:MM:SS" for logging.
+fn format_unix_as_date(ts: i64) -> String {
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 /// Priority: CLI args > env vars > config file > built-in defaults.
 pub fn parse_args() -> ResolvedArgs {
@@ -207,6 +272,35 @@ pub fn parse_args() -> ResolvedArgs {
     let password = args.password.or(cfg.password);
     let key = args.key.or(cfg.key);
     let key_passphrase = args.key_passphrase.or(cfg.key_passphrase);
+
+    // Time filters: parse since/until from CLI or config; missing => no filter.
+    let since = match args.since.or(cfg.since) {
+        Some(s) => match parse_date_arg(&s, false) {
+            Ok(ts) => Some(ts),
+            Err(e) => {
+                eprintln!("Error: invalid --since: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let until = match args.until.or(cfg.until) {
+        Some(s) => match parse_date_arg(&s, true) {
+            Ok(ts) => Some(ts),
+            Err(e) => {
+                eprintln!("Error: invalid --until: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let latest = args.latest.or(cfg.latest);
+    if let (Some(s), Some(u)) = (since, until) {
+        if s > u {
+            eprintln!("Error: --since is later than --until");
+            std::process::exit(2);
+        }
+    }
 
     // Required fields
     let user = match args.user.or(cfg.user) {
@@ -255,5 +349,8 @@ pub fn parse_args() -> ResolvedArgs {
         resume,
         parallel,
         exclude,
+        since,
+        until,
+        latest,
     }
 }

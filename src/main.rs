@@ -51,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
         resume: args.resume,
         parallel: args.parallel,
         exclude_extensions: args.exclude,
+        since: args.since,
+        until: args.until,
+        latest: args.latest,
     }).await?;
 
     // Single file summary (directory summary is printed in download_directory)

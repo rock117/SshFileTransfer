@@ -17,6 +17,12 @@ pub struct DownloadOptions {
     pub resume: bool,
     pub parallel: usize,
     pub exclude_extensions: Vec<String>,
+    /// Lower-bound mtime (inclusive), Unix seconds UTC. None = no lower bound.
+    pub since: Option<i64>,
+    /// Upper-bound mtime (inclusive), Unix seconds UTC. None = no upper bound.
+    pub until: Option<i64>,
+    /// Keep only the N most recently modified files (applied after since/until/exclude).
+    pub latest: Option<usize>,
 }
 
 impl Default for DownloadOptions {
@@ -26,6 +32,9 @@ impl Default for DownloadOptions {
             resume: false,
             parallel: 4,
             exclude_extensions: Vec::new(),
+            since: None,
+            until: None,
+            latest: None,
         }
     }
 }
@@ -36,6 +45,8 @@ pub struct DownloadTask {
     pub remote_path: String,
     pub local_path: std::path::PathBuf,
     pub file_size: u64,
+    /// File mtime in Unix seconds, when known.
+    pub mtime: Option<i64>,
 }
 
 /// SFTP downloader
@@ -73,6 +84,12 @@ impl SftpDownloader {
             if is_excluded(file_name, &options.exclude_extensions) {
                 println!("Skipped (excluded): {}", remote_path);
                 return Ok(TransferStats::new());
+            }
+            if let Some(mtime) = metadata.mtime.map(|v| v as i64) {
+                if !mtime_in_range(mtime, options.since, options.until) {
+                    println!("Skipped (out of date range): {}", remote_path);
+                    return Ok(TransferStats::new());
+                }
             }
 
             let bytes = self.download_file(remote_path, local_path, options).await?;
@@ -217,7 +234,14 @@ impl SftpDownloader {
 
         // Collect all files to download
         let tasks = self
-            .collect_tasks(remote_dir, local_dir, &options.exclude_extensions)
+            .collect_tasks(
+                remote_dir,
+                local_dir,
+                &options.exclude_extensions,
+                options.since,
+                options.until,
+                options.latest,
+            )
             .await?;
         stats.total_files = tasks.len();
         stats.total_bytes = tasks.iter().map(|t| t.file_size).sum();
@@ -328,6 +352,9 @@ impl SftpDownloader {
         remote_dir: &str,
         local_dir: &Path,
         exclude_extensions: &[String],
+        since: Option<i64>,
+        until: Option<i64>,
+        latest: Option<usize>,
     ) -> Result<Vec<DownloadTask>> {
         let mut tasks = Vec::new();
         // Normalize remote_dir: ensure it doesn't end with '/'
@@ -374,12 +401,31 @@ impl SftpDownloader {
                     continue;
                 } else {
                     let file_size = stat.size.unwrap_or(0);
+                    let mtime = stat.mtime.map(|v| v as i64);
+                    // Apply time filter at collect time so latest-N sees only matching files.
+                    if let Some(mt) = mtime {
+                        if !mtime_in_range(mt, since, until) {
+                            continue;
+                        }
+                    }
                     tasks.push(DownloadTask {
                         remote_path: full_path,
                         local_path,
                         file_size,
+                        mtime,
                     });
                 }
+            }
+        }
+
+        // Apply --latest: keep only the N most recently modified files (mtime desc).
+        if let Some(n) = latest {
+            if n == 0 {
+                tasks.clear();
+            } else if tasks.len() > n {
+                // Sort by mtime descending; files without mtime sink to the bottom.
+                tasks.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+                tasks.truncate(n);
             }
         }
 
@@ -582,4 +628,21 @@ fn is_excluded(file_name: &str, exclude_extensions: &[String]) -> bool {
     exclude_extensions
         .iter()
         .any(|ext| normalize_extension(ext) == file_ext)
+}
+
+/// Check whether a file mtime (Unix seconds) falls within [since, until].
+/// `None` bounds mean unbounded on that side. If `mtime` itself is unknown,
+/// callers should decide their own policy (we keep the file by skipping this check).
+fn mtime_in_range(mtime: i64, since: Option<i64>, until: Option<i64>) -> bool {
+    if let Some(s) = since {
+        if mtime < s {
+            return false;
+        }
+    }
+    if let Some(u) = until {
+        if mtime > u {
+            return false;
+        }
+    }
+    true
 }

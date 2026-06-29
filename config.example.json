@@ -9,5 +9,8 @@
   "timeout": 30,
   "skip": false,
   "resume": false,
-  "exclude": ["log", "tmp"]
+  "exclude": ["log", "tmp"],
+  "since": null,
+  "until": null,
+  "latest": null
 }
