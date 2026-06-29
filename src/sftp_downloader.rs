@@ -3,6 +3,7 @@ use crate::progress::{format_bytes, TransferStats};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use russh_sftp::client::SftpSession;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
@@ -15,6 +16,7 @@ pub struct DownloadOptions {
     pub skip_existing: bool,
     pub resume: bool,
     pub parallel: usize,
+    pub exclude_extensions: Vec<String>,
 }
 
 impl Default for DownloadOptions {
@@ -23,6 +25,7 @@ impl Default for DownloadOptions {
             skip_existing: false,
             resume: false,
             parallel: 4,
+            exclude_extensions: Vec::new(),
         }
     }
 }
@@ -63,6 +66,15 @@ impl SftpDownloader {
         if metadata.is_dir() {
             self.download_directory(remote_path, local_path, options).await
         } else {
+            let file_name = Path::new(remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(remote_path);
+            if is_excluded(file_name, &options.exclude_extensions) {
+                println!("Skipped (excluded): {}", remote_path);
+                return Ok(TransferStats::new());
+            }
+
             let bytes = self.download_file(remote_path, local_path, options).await?;
             Ok(TransferStats {
                 total_files: 1,
@@ -204,7 +216,9 @@ impl SftpDownloader {
         let mut stats = TransferStats::new();
 
         // Collect all files to download
-        let tasks = self.collect_tasks(remote_dir, local_dir).await?;
+        let tasks = self
+            .collect_tasks(remote_dir, local_dir, &options.exclude_extensions)
+            .await?;
         stats.total_files = tasks.len();
         stats.total_bytes = tasks.iter().map(|t| t.file_size).sum();
 
@@ -228,35 +242,40 @@ impl SftpDownloader {
             .unwrap()
             .progress_chars("=>-");
 
-        // Done style: plain message replacing the bar
+        // Done style: plain message replacing the bar in place
         let done_style = ProgressStyle::default_bar()
             .template("{msg}")
             .unwrap();
 
         let mp = MultiProgress::new();
+        let start_order = Arc::new(AtomicUsize::new(0));
+        let next_display = Arc::new(AtomicUsize::new(1));
 
         // Semaphore for parallel control
         let semaphore = Arc::new(Semaphore::new(options.parallel));
         let mut handles = Vec::new();
 
-        for (idx, task) in tasks.into_iter().enumerate() {
+        for task in tasks.into_iter() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let order = start_order.fetch_add(1, Ordering::Relaxed) + 1;
             let sftp = self.sftp.clone();
             let skip_existing = options.skip_existing;
             let mp = mp.clone();
             let active_style = active_style.clone();
             let done_style = done_style.clone();
+            let next_display = next_display.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_file_simple(
                     &sftp,
                     task,
-                    idx,
+                    order,
                     skip_existing,
                     &mp,
                     active_style,
                     done_style,
                     total_files,
+                    next_display,
                 )
                 .await;
                 drop(permit);
@@ -308,6 +327,7 @@ impl SftpDownloader {
         &self,
         remote_dir: &str,
         local_dir: &Path,
+        exclude_extensions: &[String],
     ) -> Result<Vec<DownloadTask>> {
         let mut tasks = Vec::new();
         // Normalize remote_dir: ensure it doesn't end with '/'
@@ -350,6 +370,8 @@ impl SftpDownloader {
 
                 if stat.is_dir() {
                     dirs_to_visit.push(full_path);
+                } else if is_excluded(&file_name, exclude_extensions) {
+                    continue;
                 } else {
                     let file_size = stat.size.unwrap_or(0);
                     tasks.push(DownloadTask {
@@ -393,16 +415,24 @@ fn create_file_progress_bar(size: u64) -> ProgressBar {
     pb
 }
 
-/// Download file with real-time progress bar; finish bar with final stats line
+/// Wait until it is this task's turn to create a progress bar line
+async fn wait_for_display_turn(order: usize, next_display: &AtomicUsize) {
+    while next_display.load(Ordering::Acquire) != order {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Download file with real-time progress bar; display order follows start order
 async fn download_file_simple(
     sftp: &SftpSession,
     task: DownloadTask,
-    idx: usize,
+    order: usize,
     skip_existing: bool,
     mp: &MultiProgress,
     active_style: ProgressStyle,
     done_style: ProgressStyle,
     total_files: usize,
+    next_display: Arc<AtomicUsize>,
 ) -> Result<u64> {
     let file_name = Path::new(&task.remote_path)
         .file_name()
@@ -410,12 +440,14 @@ async fn download_file_simple(
         .unwrap_or(&task.remote_path);
     let prefix = format!(
         "({}/{}) {:<28}",
-        idx + 1,
+        order,
         total_files,
         truncate_str(file_name, 28)
     );
 
+    wait_for_display_turn(order, &next_display).await;
     let pb = mp.add(ProgressBar::new(task.file_size));
+    next_display.fetch_add(1, Ordering::Release);
     pb.set_style(active_style);
     pb.set_prefix(prefix.clone());
 
@@ -489,12 +521,24 @@ async fn download_file_simple(
     Ok(total_read)
 }
 
-/// Print file download result
-fn print_file_result(current: usize, total: usize, name: &str, size: u64, transferred: u64, speed: Option<u64>) {
-    let percent = if size > 0 { (transferred * 100 / size) as usize } else { 100 };
-    let speed_str = speed.map(|s| format!("{}/s", format_bytes(s))).unwrap_or_else(|| "N/A".to_string());
+fn format_file_result(
+    current: usize,
+    total: usize,
+    name: &str,
+    size: u64,
+    transferred: u64,
+    speed: Option<u64>,
+) -> String {
+    let percent = if size > 0 {
+        (transferred * 100 / size) as usize
+    } else {
+        100
+    };
+    let speed_str = speed
+        .map(|s| format!("{}/s", format_bytes(s)))
+        .unwrap_or_else(|| "N/A".to_string());
 
-    println!(
+    format!(
         "({}/{}) {:<30} {:>10}  {:>3}%  {}",
         current,
         total,
@@ -502,7 +546,12 @@ fn print_file_result(current: usize, total: usize, name: &str, size: u64, transf
         format_bytes(transferred),
         percent,
         speed_str
-    );
+    )
+}
+
+/// Print file download result
+fn print_file_result(current: usize, total: usize, name: &str, size: u64, transferred: u64, speed: Option<u64>) {
+    println!("{}", format_file_result(current, total, name, size, transferred, speed));
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -511,4 +560,26 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
     }
+}
+
+fn normalize_extension(ext: &str) -> String {
+    ext.trim_start_matches('.').to_lowercase()
+}
+
+fn is_excluded(file_name: &str, exclude_extensions: &[String]) -> bool {
+    if exclude_extensions.is_empty() {
+        return false;
+    }
+
+    let Some(file_ext) = Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(normalize_extension)
+    else {
+        return false;
+    };
+
+    exclude_extensions
+        .iter()
+        .any(|ext| normalize_extension(ext) == file_ext)
 }

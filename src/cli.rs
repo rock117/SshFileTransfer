@@ -53,6 +53,10 @@ pub struct Args {
     /// Maximum parallel downloads for directory
     #[arg(short = 'j', long, default_value_t = 4)]
     pub parallel: usize,
+
+    /// Exclude file extensions (repeatable, e.g. --exclude log --exclude .tmp)
+    #[arg(short = 'x', long = "exclude", value_name = "EXT")]
+    pub exclude: Vec<String>,
 }
 
 pub fn parse_args() -> Args {
