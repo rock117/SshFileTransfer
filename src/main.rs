@@ -1,6 +1,5 @@
-use clap::Parser;
 use sftp_download::{
-    cli::Args,
+    cli::parse_args,
     sftp_downloader::{DownloadOptions, SftpDownloader},
     ssh_client::{AuthMethod, SshClient, SshConfig},
 };
@@ -16,7 +15,10 @@ async fn main() -> anyhow::Result<()> {
         .with_level(false)
         .init();
 
-    let args = Args::parse();
+    let args = parse_args();
+
+    // Print the final resolved command line (secrets masked) for traceability.
+    println!("> {}", args.to_command_line());
 
     // Build auth method
     let auth = if let Some(key_path) = &args.key {
@@ -27,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     } else if let Some(password) = &args.password {
         AuthMethod::Password(password.clone())
     } else {
-        eprintln!("Error: Either --password or --key is required");
+        eprintln!("Error: Either --password or --key is required (via CLI or config file)");
         std::process::exit(1);
     };
 

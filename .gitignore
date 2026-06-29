@@ -3,3 +3,7 @@
 /local/
 /data2/
 /run.py
+/config.toml
+/config.json
+/config.yaml
+/config.yml

@@ -1,0 +1,18 @@
+# Example config for sftp-download (TOML format)
+# Copy to config.toml and edit. Real config.toml is gitignored.
+# Usage: cargo run -- --config config.toml
+# Any CLI flag overrides the corresponding value here.
+
+host = "xxxx"
+port = 22
+user = "user1"
+password = "passwd123"     # or use `key` below instead
+# key = "C:/path/to/id_rsa"
+# key_passphrase = "secret"
+remote = "/home/logs"
+local = "C:/rock/logs"
+parallel = 4
+timeout = 30
+skip = false
+resume = false
+exclude = ["log", "tmp"]

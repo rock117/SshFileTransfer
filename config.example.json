@@ -1,0 +1,13 @@
+{
+  "host": "xxxx",
+  "port": 22,
+  "user": "user1",
+  "password": "passwd123",
+  "remote": "/home/logs",
+  "local": "C:/rock/logs",
+  "parallel": 4,
+  "timeout": 30,
+  "skip": false,
+  "resume": false,
+  "exclude": ["log", "tmp"]
+}

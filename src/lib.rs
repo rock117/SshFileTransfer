@@ -4,7 +4,7 @@ pub mod progress;
 pub mod sftp_downloader;
 pub mod ssh_client;
 
-pub use cli::Args;
+pub use cli::{Args, ResolvedArgs};
 pub use error::{AppError, Result};
 pub use progress::TransferStats;
 pub use sftp_downloader::{DownloadOptions, DownloadTask, SftpDownloader};
