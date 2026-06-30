@@ -278,8 +278,12 @@ pub fn parse_args() -> ResolvedArgs {
                 std::process::exit(1);
             }
         },
-        // Missing file or no --config: silently ignore.
-        _ => FileConfig::default(),
+        Some(p) => {
+            eprintln!("Warning: config file '{}' not found, ignoring", p.display());
+            FileConfig::default()
+        }
+        // No --config: use built-in defaults and CLI/env only.
+        None => FileConfig::default(),
     };
 
     // Merge: CLI value wins over config value, then fall back to defaults.
