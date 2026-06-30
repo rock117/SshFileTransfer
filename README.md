@@ -12,6 +12,10 @@
 - ✅ 断点续传
 - ✅ 并发下载
 - ✅ 进度条显示
+- ✅ 配置文件加载（TOML/JSON/YAML）
+- ✅ glob 通配符过滤文件（include/exclude）
+- ✅ 按最近修改时间过滤文件（since/until/latest）
+- ✅ 启动时打印解析后的命令行（密码自动脱敏）
 
 ## 安装
 
@@ -35,6 +39,9 @@ cargo run -- -H 192.168.1.100 -u admin -P password --remote /path/to/file --loca
 
 # 下载目录并指定并发数
 cargo run -- -H server.com -u user --key ~/.ssh/id_rsa --remote /data --local ./backup --parallel 8
+
+# 使用配置文件
+cargo run -- --config config.toml
 ```
 
 > **说明**：
@@ -56,6 +63,89 @@ sftp-download -H server.com -u user --key ~/.ssh/id_rsa --remote /data --local .
 sftp-download -H server.com -p 2222 -u user -P password --remote /file --local ./file
 ```
 
+### 配置文件
+
+支持从配置文件加载参数，格式通过扩展名自动识别（`.toml` / `.json` / `.yaml` / `.yml`）。配置文件缺失时自动忽略，纯命令行模式依然可用。
+
+优先级：**命令行参数 > 环境变量 > 配置文件 > 内置默认值**。
+
+```bash
+# 显式指定配置文件
+sftp-download --config config.toml
+
+# 不指定配置文件时，所有参数都从命令行传入
+sftp-download -H server.com -u admin -P password --remote /data --local ./data
+```
+
+示例 `config.toml`（项目根目录有 `config.example.toml` 模板）：
+
+```toml
+host = "server.com"
+port = 22
+user = "admin"
+password = "password"
+remote = "/data"
+local = "./data"
+parallel = 8
+exclude = ["*.tmp", "*~"]
+include = ["*.log"]
+ignore_case = false
+since = "2026-06-01"
+latest = 10
+```
+
+### 文件过滤
+
+支持使用 glob 通配符对文件名（basename）进行过滤。语法：
+
+- `*` 匹配任意字符序列（包括空）
+- `?` 匹配单个字符
+- `[abc]` / `[a-z]` / `[!abc]` 字符集
+
+```bash
+# 只下载 .log 和 .txt 文件
+sftp-download -H server.com -u admin -P password --remote /data --local ./data \
+  --include "*.log" --include "*.txt"
+
+# 下载所有 .log 文件，但排除以 debug 开头的
+sftp-download -H server.com -u admin -P password --remote /data --local ./data \
+  --include "*.log" --exclude "debug*"
+
+# 排除临时文件和备份文件
+sftp-download -H server.com -u admin -P password --remote /data --local ./data \
+  --exclude "*.tmp" --exclude "*~" --exclude "*.bak"
+
+# 大小写不敏感匹配
+sftp-download -H server.com -u admin -P password --remote /data --local ./data \
+  --include "*.LOG" --ignore-case
+```
+
+**过滤规则**：
+- `include` 为空：不启用白名单，所有文件都进入下一步
+- `include` 非空：只保留匹配任一模式的文件
+- `exclude` 为空：不剔除任何文件
+- `exclude` 非空：从 `include` 过滤后的结果中剔除匹配的文件
+
+### 时间过滤
+
+按远程文件的修改时间（mtime）过滤：
+
+```bash
+# 只下载 2026-06-01 之后修改的文件
+sftp-download -H server.com -u admin -P password --remote /data --local ./data --since "2026-06-01"
+
+# 只下载 2026-06-30 之前修改的文件
+sftp-download -H server.com -u admin -P password --remote /data --local ./data --until "2026-06-30"
+
+# 下载最近 7 天内修改的最新 10 个文件
+sftp-download -H server.com -u admin -P password --remote /data --local ./data \
+  --since "2026-06-23" --latest 10
+```
+
+日期格式：
+- `YYYY-MM-DD`：`--since` 取当天 00:00:00，`--until` 取当天 23:59:59（含边界当天）
+- `YYYY-MM-DD HH:MM:SS`：精确到秒
+
 ### 高级选项
 
 ```bash
@@ -67,12 +157,16 @@ sftp-download -H server.com -u user -P password --remote /data --local ./data --
 
 # 指定并发下载数（仅目录）
 sftp-download -H server.com -u user -P password --remote /project --local ./project --parallel 8
+
+# 组合：配置文件 + 命令行覆盖
+sftp-download --config config.toml --host real.server.com --latest 5
 ```
 
 ### 命令行参数
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
+| `--config` | - | 配置文件路径（.toml/.json/.yaml/.yml） | - |
 | `--host` | `-H` | SSH 服务器地址 | localhost |
 | `--port` | `-p` | SSH 服务器端口 | 22 |
 | `--user` | `-u` | SSH 用户名 | (必需) |
@@ -82,11 +176,23 @@ sftp-download -H server.com -u user -P password --remote /project --local ./proj
 | `--timeout` | - | 连接超时(秒) | 30 |
 | `--remote` | `-r` | 远程文件/目录路径 | (必需) |
 | `--local` | `-l` | 本地保存路径 | (必需) |
-| `--skip` | `-f` | 跳过已存在文件 | false（默认覆盖） |
+| `--skip` | `-s` | 跳过已存在文件 | false（默认覆盖） |
 | `--resume` | - | 断点续传（仅文件） | false |
 | `--parallel` | `-j` | 并发下载数（仅目录） | 4 |
+| `--exclude` | `-x` | 排除匹配 glob 的文件（可重复） | - |
+| `--include` | `-i` | 只下载匹配 glob 的文件（可重复） | - |
+| `--ignore-case` | - | include/exclude 大小写不敏感 | false |
+| `--since` | - | 只下载该日期后修改的文件 | - |
+| `--until` | - | 只下载该日期前修改的文件 | - |
+| `--latest` | - | 只下载最近修改的 N 个文件 | - |
 
 ## 示例输出
+
+启动时打印解析后的命令行（密码/密钥密码自动脱敏为星号）：
+
+```
+> sftp-download -H server.com -p 22 -u admin -P "********" --timeout 30 -r /data -l ./data -j 4 -x "*.tmp" -i "*.log"
+```
 
 下载目录：
 ```
@@ -115,6 +221,8 @@ Downloaded 256.00 MiB in 49.23s (5.2 MiB/s)
 - **tokio** - 异步运行时
 - **clap** - 命令行解析
 - **indicatif** - 进度条显示
+- **chrono** - 日期时间解析
+- **serde/toml/serde_json/serde_yaml** - 配置文件解析
 
 ## 许可证
 
